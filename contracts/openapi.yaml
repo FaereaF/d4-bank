@@ -1,19 +1,19 @@
-# Описание HTTP API района (соглашение Р6). Нет описания — нет API.
-# Проверить файл можно в https://editor.swagger.io (вставить текст) или
-# локально: pipx run openapi-spec-validator contracts/openapi.yaml
+# Описание HTTP API района (соглашение Р6).
+# Проверка: pipx run openapi-spec-validator openapi_completed.yaml
 openapi: 3.1.0
 info:
   title: Район 4 — Банк (API)
-  version: 0.1.0
+  version: 0.2.0
   description: |
-    Черновик v0 (неделя 2). Аутентификация появится на неделе 4:
-    люди — токен OIDC Паспортного стола (Authorization: Bearer ...),
-    сервисы — mTLS с сертификатом городского УЦ.
+    Контракт API района «Банк». В городской среде пользовательские запросы
+    аутентифицируются токеном OIDC Паспортного стола (Authorization: Bearer ...).
+    Межсервисное взаимодействие защищается mTLS с сертификатом городского УЦ.
+    Описание задаёт ожидаемое поведение; фактическую реализацию нужно проверить отдельно.
 servers:
   - url: https://api.bank.city.lab
-    description: адрес в городе (после недели 3)
+    description: Адрес в городской среде
   - url: http://127.0.0.1:8080
-    description: локальный запуск
+    description: Локальный запуск для разработки
 paths:
   /health:
     get:
@@ -28,42 +28,210 @@ paths:
                 type: object
                 required: [status]
                 properties:
-                  status: {type: string, const: ok}
-  /api/v1/info:
-    get:
-      summary: Пример эндпоинта — замените на настоящие операции района
-      operationId: getInfo
+                  status:
+                    type: string
+                    const: ok
+  /api/v1/transfers:
+    post:
+      summary: Создать перевод между банковскими счетами
+      operationId: createTransfer
+      description: |
+        Создаёт перевод от имени аутентифицированного пользователя.
+        Сервер обязан проверить права пользователя на счёт отправителя,
+        положительность суммы, валюту и достаточность доступного баланса.
+        Списание и зачисление выполняются атомарно. Заголовок Idempotency-Key
+        обязателен: повтор с тем же ключом и тем же телом не выполняет перевод
+        повторно и возвращает исходный результат; тот же ключ с другим телом
+        возвращает 409 Conflict.
+      security:
+        - OIDC: []
       parameters:
         - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransferRequest"
+            example:
+              from_account_id: "acc-1001"
+              to_account_id: "acc-2042"
+              amount: "1250.00"
+              currency: "RUB"
       responses:
-        "200":
-          description: Информация о сервисе
+        "201":
+          description: Перевод создан и успешно проведён
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  district: {type: string, example: bank}
-                  service: {type: string, example: api}
-        default:
-          $ref: "#/components/responses/Problem"
+                $ref: "#/components/schemas/Transfer"
+              example:
+                transfer_id: "tr-7f4a"
+                from_account_id: "acc-1001"
+                to_account_id: "acc-2042"
+                amount: "1250.00"
+                currency: "RUB"
+                status: "completed"
+                created_at: "2026-10-25T03:00:00Z"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Конфликт ключа идемпотентности или состояния операции
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "about:blank"
+                title: "Idempotency conflict"
+                status: 409
+                detail: "Этот Idempotency-Key уже использован с другим телом запроса."
+        "422":
+          description: Некорректная сумма или недостаточно средств
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              examples:
+                invalid_amount:
+                  summary: Сумма должна быть положительной
+                  value:
+                    type: "about:blank"
+                    title: "Invalid amount"
+                    status: 422
+                    detail: "Сумма перевода должна быть больше нуля."
+                insufficient_funds:
+                  summary: Недостаточно средств
+                  value:
+                    type: "about:blank"
+                    title: "Insufficient funds"
+                    status: 422
+                    detail: "На счёте отправителя недостаточно доступных средств."
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
 components:
+  securitySchemes:
+    OIDC:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Токен OIDC Паспортного стола; проверяются подпись, issuer, audience и срок действия.
   parameters:
     RequestId:
       name: X-Request-ID
       in: header
       required: false
-      description: Сквозной идентификатор запроса; если нет — сервис создаёт новый
-      schema: {type: string, maxLength: 64}
-  responses:
+      description: Сквозной идентификатор для трассировки; если отсутствует, сервис создаёт новый.
+      schema:
+        type: string
+        maxLength: 64
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Уникальный ключ операции. Один ключ нельзя использовать для разных тел запросов.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+  schemas:
+    TransferRequest:
+      type: object
+      additionalProperties: false
+      required: [from_account_id, to_account_id, amount, currency]
+      properties:
+        from_account_id:
+          type: string
+          minLength: 1
+          description: Идентификатор счёта отправителя. Пользователь должен иметь право распоряжаться этим счётом.
+        to_account_id:
+          type: string
+          minLength: 1
+          description: Идентификатор счёта получателя.
+        amount:
+          type: string
+          pattern: '^(0|[1-9][0-9]*)(\\.[0-9]{1,2})?$'
+          examples: ["1250.00"]
+          description: Денежная сумма в десятичном формате с точностью до двух знаков. Значение должно быть строго больше нуля.
+        currency:
+          type: string
+          enum: [RUB]
+          description: Валюта перевода. В этой версии поддерживается RUB.
+    Transfer:
+      type: object
+      required: [transfer_id, from_account_id, to_account_id, amount, currency, status, created_at]
+      properties:
+        transfer_id:
+          type: string
+        from_account_id:
+          type: string
+        to_account_id:
+          type: string
+        amount:
+          type: string
+          pattern: '^(0|[1-9][0-9]*)(\\.[0-9]{1,2})?$'
+        currency:
+          type: string
+          enum: [RUB]
+        status:
+          type: string
+          enum: [completed]
+        created_at:
+          type: string
+          format: date-time
+          description: Время создания операции в UTC.
     Problem:
-      description: Ошибка в формате RFC 9457
+      type: object
+      description: Ошибка в формате RFC 9457.
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+  responses:
+    BadRequest:
+      description: Некорректный JSON или отсутствуют обязательные поля
       content:
         application/problem+json:
           schema:
-            type: object
-            properties:
-              type: {type: string}
-              title: {type: string}
-              status: {type: integer}
-              detail: {type: string}
+            $ref: "#/components/schemas/Problem"
+    Unauthorized:
+      description: Отсутствует или недействителен токен пользователя
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Forbidden:
+      description: У пользователя нет прав на счёт отправителя или операцию
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    TooManyRequests:
+      description: Превышен лимит запросов
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Число секунд до возможного повторного запроса.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    InternalError:
+      description: Внутренняя ошибка; финансовая операция не должна оставаться в частично проведённом состоянии
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
