@@ -1,5 +1,5 @@
 # Описание HTTP API района (соглашение Р6).
-# Проверка: pipx run openapi-spec-validator openapi_completed.yaml
+# Проверка: pipx run openapi-spec-validator contracts/openapi.yaml
 openapi: 3.1.0
 info:
   title: Район 4 — Банк (API)
